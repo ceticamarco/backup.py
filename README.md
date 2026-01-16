@@ -1,4 +1,5 @@
-# backup.sh ![](https://github.com/ceticamarco/backup.sh/actions/workflows/backup.sh.yml/badge.svg)
+# backup.sh ![](https://git.marcocetica.com/marco/backup.sh/actions/workflows/backup.sh.yml/badge.svg)
+
 `backup.sh` is a POSIX compliant, modular and lightweight backup utility to save and encrypt your files.
 This tool is intended to be used on small scale UNIX environments such as VPS, personal servers and
 workstations. `backup.sh` uses [rsync](https://linux.die.net/man/1/rsync), [tar](https://linux.die.net/man/1/tar), 
