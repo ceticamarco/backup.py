@@ -1,4 +1,0 @@
-ssh=/etc/ssh/
-nginx=/etc/nginx/
-logs=/var/log/
-web_root=/var/www/

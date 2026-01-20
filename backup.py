@@ -1,0 +1,488 @@
+#!/usr/bin/env python3
+# backup.py: modular and lightweight backup utility
+# Developed by Marco Cetica (c) 2018, 2023, 2024, 2026
+#
+
+import argparse
+import shutil
+import sys
+import os
+import time
+import tarfile
+import subprocess
+import hashlib
+import getpass
+from pathlib import Path
+from datetime import datetime
+from dataclasses import dataclass
+from typing import Generic, TypeVar, Union, Literal, List
+
+T = TypeVar("T")
+
+@dataclass(frozen=True)
+class Ok(Generic[T]):
+    """Sum type to represent results"""
+    value: T
+    success: Literal[True] = True
+
+@dataclass(frozen=True)
+class Err:
+    error: str
+    success: Literal[False] = False
+
+Result = Union[Ok[T], Err]
+
+@dataclass
+class BackupSource:
+    """Struct to represent a mapping between a label and a path"""
+    label: str
+    path: Path
+
+@dataclass
+class BackupState:
+    """Struct to represent a backup state"""
+    sources: List[BackupSource]
+    output_path: Path
+    password: str
+    checksum: bool
+    verbose: bool
+
+class BackupProgress:
+    """Progress indicator for backup operations"""
+    def __init__(self, total: int, operation: str):
+        self.total = total
+        self.current = 0
+        self.operation = operation
+
+    def update(self, message: str = ""):
+        """Update progress"""
+        self.current += 1
+        percentage = (self.current / self.total) * 100 if self.total > 0 else 0
+
+        status = f"\r{self.operation}: [{self.current}/{self.total}] {percentage: .1f}% - {message}"
+        print(f"\r\033[K{status}", end='', flush=True)
+
+    def finish(self):
+        """Print new line"""
+        print()
+
+class Backup:
+    @staticmethod
+    def check_deps() -> Result[None]:
+        """Check whether dependencies are installed"""
+        missing_deps = []
+        for dep in ["gpg", "tar"]:
+            if not shutil.which(dep):
+                missing_deps.append(dep)
+
+        if missing_deps:
+            return Err(f"Missing dependencies: {', '.join(missing_deps)}")
+
+        return Ok(None)
+
+    @staticmethod
+    def prettify_size(byte_size: int) -> str:
+        """Convert byte_size in powers of 1024"""
+        units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"]
+        idx = 0
+        size = float(byte_size)
+
+        while size >= 1024.0 and idx < (len(units) - 1):
+            size /= 1024.0
+            idx += 1
+
+        if size.is_integer():
+            return f"{int(size)} {units[idx]}"
+
+        return f"{size:.2f} {units[idx]}"
+
+    @staticmethod
+    def parse_sources_file(sources_file: Path) -> Result[List[BackupSource]]:
+        """Parse the sources file returning a list of BackupSource elements"""
+        if not sources_file.exists():
+            return Err("Sources file does not exist")
+
+        sources: List[BackupSource] = []
+        try:
+            with open(sources_file, 'r') as f:
+                for pos, line in enumerate(f, 1):
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+
+                    if '=' not in line:
+                        print(f"Warning: invalid format at line {pos}: {line}")
+
+                    label, path_str = line.split('=', 1)
+                    path = Path(path_str.strip())
+
+                    if not path.exists():
+                        return Err(f"Path does not exist: {path}")
+
+                    sources.append(BackupSource(label.strip(), path))
+        except IOError as err:
+            return Err(f"Failed to read sources file: {err}")
+
+        if not sources:
+            return Err(f"No valid sources found in file")
+
+        return Ok(sources)
+
+    @staticmethod
+    def should_ignore_file(path: Path) -> bool:
+        """Check whether a file should be ignored"""
+        try:
+            # Skip UNIX sockets
+            if path.is_socket():
+                return True
+
+            # Skip broken symlinks
+            if path.is_symlink() and not path.exists():
+                return True
+
+            # Skip named pipes (FIFOs)
+            if path.stat().st_mode & 0o170000 == 0o010000:
+                return True
+
+            return False
+        except (OSError, IOError):
+            # Skip files that can't be checked
+            return True
+
+    @staticmethod
+    def ignore_special_files(directory: str, contents: List[str]) -> List[str]:
+        """Return a list of files to ignore"""
+        ignored_files: List[str] = []
+        dir_path = Path(directory)
+
+        for item in contents:
+            item_path = dir_path / item
+            if Backup.should_ignore_file(item_path):
+                ignored_files.append(item)
+
+        return ignored_files
+
+    @staticmethod
+    def copy_files(source: Path, destination: Path, verbose: bool) -> Result[None]:
+        """Copy files and directories preserving their metadata"""
+        try:
+            # Handle single file
+            if source.is_file():
+                # Parent directory might not exists, so we try to create it first
+                destination.parent.mkdir(parents=True, exist_ok=True)
+
+                if verbose:
+                    print(f"Copying file {source} -> {destination}")
+
+                # Copy file and its metadata
+                shutil.copy2(source, destination)
+
+                return Ok(None)
+
+            # Handle directory
+            if source.is_dir():
+                # If destination directory exists, we remove it
+                # This approach mimics rsync's --delete option
+                if destination.exists():
+                    shutil.rmtree(destination)
+
+                if verbose:
+                    print(f"Copying directory {source} -> {destination}")
+
+                # Copy directory and its metadata.
+                # We also ignore special files and we preserves links instead
+                # of following them.
+                shutil.copytree(
+                    source,
+                    destination,
+                    symlinks=True, # True = preserve symlinks
+                    copy_function=shutil.copy2,
+                    ignore=Backup.ignore_special_files,
+                    dirs_exist_ok=False
+                )
+
+                return Ok(None)
+
+            return Err(f"The following source element is neither a file nor a directory: {source}")
+
+        except (IOError, OSError, shutil.Error) as err:
+            return Err(f"Copy failed: {err}")
+
+    @staticmethod
+    def cleanup_files(*paths: Path) -> None:
+        """Clean up temporary files and directories"""
+        for path in paths:
+            if not path.exists():
+                continue
+
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                path.unlink(missing_ok=True)
+
+    @staticmethod
+    def collect_files(directory: Path) -> List[Path]:
+        """Collect all files in a directory (recursively)"""
+        files = []
+        for item in directory.rglob('*'):
+            if item.is_file() and not item.is_symlink():
+                files.append(item)
+
+        return files
+
+    @staticmethod
+    def compute_file_hash(file_path: Path) -> Result[str]:
+        """Compute SHA256 hash of a given file"""
+        try:
+            with open(file_path, "rb") as f:
+                for byte_block in iter(lambda: f.read(4096), b""):
+                    hashlib.sha256().update(byte_block)
+            return Ok(hashlib.sha256().hexdigest())
+        except IOError as e:
+            return Err(f"Failed to read file {file_path}: {e}")
+
+    @staticmethod
+    def create_tarball(source_dir: Path, output_file: Path, verbose: bool) -> Result[None]:
+        """Create a compressed tar archive of the backup directory"""
+        if verbose:
+            print("Compressing backup...")
+
+        cmd = [
+            "tar",
+            "-czf",
+            str(output_file),
+            "-C",
+            str(source_dir.parent),
+            source_dir.name
+        ]
+
+        if verbose:
+            cmd[1] += "-v"
+
+        # capture here means suppress it/holding it
+        result = subprocess.run(cmd, capture_output=not verbose, text=None)
+
+        if result.returncode != 0:
+            error_msg = f"tar failed: {result.stderr if result.stderr else 'Unknown error code'}"
+
+            return Err(error_msg)
+
+        return Ok(None)
+
+    @staticmethod
+    def encrypt_file(input_file: Path, output_file: Path, password: str, verbose: bool) -> Result[None]:
+        """Encrypt a file with GPG in symmetric mode (using AES256)"""
+        if verbose:
+            print("Encrypting backup...")
+
+        cmd = [
+            "gpg", "-a",
+            "--symmetric",
+            "--cipher-algo=AES256",
+            "--no-symkey-cache",
+            "--pinentry-mode=loopback",
+            "--batch",
+            "--passphrase-fd", "0",
+            "--output", str(output_file),
+            str(input_file)
+        ]
+
+        result = subprocess.run(
+            cmd,
+            input=password.encode(),
+            capture_output=not verbose
+        )
+
+        if result.returncode != 0:
+            return Err(f"Encryption failed: {result.stderr.decode()}")
+
+        return Ok(None)
+
+    def make_backup(self, config: BackupState) -> Result[None]:
+        """Create an encrypted backup from specified sources file"""
+        # Check root permissions
+        if os.geteuid() != 0:
+            return Err("Run this program as root!")
+
+        start_time = time.time()
+        date_str = datetime.now().strftime("%Y%m%d")
+        hostname = os.uname().nodename
+
+        # Create working directory
+        work_dir = config.output_path / "backup.sh.tmp"
+        if not work_dir.exists():
+            work_dir.mkdir(parents=True, exist_ok=True)
+
+        # Format output files
+        backup_archive = config.output_path / f"backup-{hostname}-{date_str}.tar.gz.enc"
+        checksum_file = config.output_path / f"backup-{hostname}-{date_str}.sha256"
+        temp_tarball = config.output_path / "backup.sh.tar.gz"
+
+        # Backup each source
+        sources_count = len(config.sources)
+        for idx, source in enumerate(config.sources, 1):
+            print(f"Copying {source.label} ({idx}/{sources_count})")
+
+            # Create source subdirectory
+            source_dir = work_dir / f"backup-{source.label}-{date_str}"
+            if not source_dir.exists():
+                source_dir.mkdir(parents=True, exist_ok=True)
+
+            # Copy files
+            copy_res = self.copy_files(source.path, work_dir, config.verbose)
+            match copy_res:
+                case Err():
+                    self.cleanup_files(work_dir, temp_tarball)
+                    return copy_res
+                case Ok(): pass
+
+            # Compute checksum when requested
+            if config.checksum:
+                files = self.collect_files(source_dir)
+
+                backup_progress: BackupProgress | None = None
+
+                if config.verbose:
+                    backup_progress = BackupProgress(len(files), "Computing checksums")
+
+                checksum_fd = open(checksum_file, 'a')
+                for file in files:
+                    hash_result = self.compute_file_hash(file)
+                    match hash_result:
+                        case Err():
+                            checksum_fd.close()
+                            self.cleanup_files(work_dir, temp_tarball)
+                            return hash_result
+                        case Ok(value=v):
+                            checksum_fd.write(f"{v}\n")
+
+                    if config.verbose and backup_progress is not None:
+                        backup_progress.update(str(file.name))
+
+                checksum_fd.close()
+
+                if config.verbose and backup_progress is not None:
+                    backup_progress.finish()
+
+        # Create compressed archive
+        archive_res = self.create_tarball(work_dir, temp_tarball, config.verbose)
+        match archive_res:
+            case Err():
+                self.cleanup_files(work_dir, temp_tarball)
+                return archive_res
+            case Ok(): pass
+
+        # Encrypt the archive
+        encrypt_res = self.encrypt_file(temp_tarball, backup_archive, config.password, config.verbose)
+        match encrypt_res:
+            case Err():
+                self.cleanup_files(work_dir, temp_tarball)
+                return encrypt_res
+            case Ok(): pass
+
+        # Cleanup temporary files
+        self.cleanup_files(work_dir, temp_tarball)
+
+        # Compute file size
+        if not backup_archive.exists():
+            return Err("Unable to create backup archive")
+
+        elapsed_time = time.time() - start_time
+        file_size = backup_archive.stat().st_size
+        file_size_hr = Backup.prettify_size(file_size)
+
+        print(f"\nBackup complete")
+        print(f"File name: {backup_archive}")
+        if config.checksum:
+            print(f"Checksum file: {checksum_file}")
+        print(f"File size: {file_size} bytes ({file_size_hr})")
+        print(f"Elapsed time: {elapsed_time:.2f} seconds")
+
+        return Ok(None)
+    
+def main():
+    parser = argparse.ArgumentParser(
+        description="backup.py - modular and lightweight backup utility",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Usage:
+  > Create a backup
+  sudo ./backup.py --backup sources.bk /home/user $PASS
+
+  > Create backup with checksum
+  sudo ./backup.py --checksum --backup sources.bk /home/user $PASS
+
+  > Extract and verify checksum
+  ./backup.py --checksum --extract backup.tar.gz.enc $PASS hashes.sha256
+
+  For more information visit: https://git.marcocetica.com/marco/backup.py
+  or issue `man backup.py` on your terminal.
+        """
+    )
+
+    parser.add_argument(
+        "-b", "--backup",
+        nargs=3,
+        metavar=("SOURCES", "DEST", "PASS"),
+        help="Backup files from SOURCES path to DEST directory with password PASS"
+    )
+
+    parser.add_argument(
+        "-e", "--extract",
+        nargs="+",
+        metavar="ARCHIVE",
+        help="Extract ARCHIVE (optionally with PASS and SHA256 file)"
+    )
+
+    parser.add_argument(
+        "-c", "--checksum",
+        action="store_true",
+        help="Generate or check SHA256 checksums"
+    )
+
+    parser.add_argument(
+        "-V", "--verbose",
+        action="store_true",
+        help="Enable verbose mode"
+    )
+
+    args = parser.parse_args()
+
+    # Check whether dependencies are installed
+    deps_res = Backup.check_deps()
+    match deps_res:
+        case Err(error=e): print(f"Error: {e}", file=sys.stderr)
+        case Ok(): pass
+
+    backup = Backup()
+
+    if args.backup:
+        sources_file, output_path, password = args.backup
+
+        sources_path = Path(sources_file)
+        output_dir = Path(output_path)
+
+        # Create output directory if it doesn't exist
+        if not output_dir.exists():
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Parse sources file
+        sources_res = Backup.parse_sources_file(sources_path)
+        config: BackupState
+        match sources_res:
+            case Err(error=e):
+                print(f"Error: {e}", file=sys.stderr)
+                sys.exit(1)
+            case Ok(value=v):
+                # Create a backup state
+                config = BackupState(
+                    sources=v,
+                    output_path=output_dir,
+                    password=password,
+                    checksum=args.checksum,
+                    verbose=args.verbose
+                )
+        
+
+if __name__ == "__main__":
+    main()
