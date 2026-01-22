@@ -13,19 +13,17 @@ import hashlib
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass
-from typing import Generic, TypeVar, Union, Literal, Optional, List
+from typing import Generic, TypeVar, Union, Optional, List
 
 T = TypeVar("T")
 @dataclass(frozen=True)
 class Ok(Generic[T]):
     """Sum type to represent results"""
     value: T
-    success: Literal[True] = True
 
 @dataclass(frozen=True)
 class Err:
     error: str
-    success: Literal[False] = False
 
 Result = Union[Ok[T], Err]
 
@@ -46,10 +44,15 @@ class BackupState:
 
 class BackupProgress:
     """Progress indicator for backup operations"""
-    def __init__(self, total: int, operation: str) -> None:
+    def __init__(self, total: int, operation: str, status_msg: str) -> None:
         self.total = total
         self.current = 0
         self.operation = operation
+        self.status_msg = status_msg
+
+    def log_operation(self) -> None:
+        """Print the Backup operation to stdout"""
+        print(self.operation)
 
     def draw_progress_bar(self, message: str = "") -> None:
         """draw progress bar"""
@@ -64,11 +67,14 @@ class BackupProgress:
         status = f"\r└──{self.operation} [{bar}] {percentage:.1f}% ({self.current}/{self.total}) - (processing '{message}')"
         print(f"\r\033[K{status}", end='', flush=True)
 
-    def finish(self, initial_message: str, new_line: bool) -> None:
-        """Close the CLI UI"""
-        esc_char = 'L' if new_line else 'A'
-        print(f'\033[{esc_char}\r{initial_message}DONE')
-        print()
+    def complete_task(self) -> None:
+        """Complete a task"""
+        # To complete a task, we do the following:
+        #  1. Move the cursor one line upwards
+        #  2. Move the cursor at end of operation message (i.e., rewrite the message)
+        #  3. Add 'DONE' there
+        #  4. Move the cursor downwards one line
+        print(f'\033[A\r{self.operation}DONE\n')
 
 class Backup:
     @staticmethod
@@ -250,9 +256,9 @@ class Backup:
         """Create a compressed tar archive of the backup directory"""
         progress: BackupProgress | None = None
         if verbose:
-            print("Compressing backup...")
             total_entries = Backup.count_tar_entries(source_dir)
-            progress = BackupProgress(total_entries, "compressing")
+            progress = BackupProgress(total_entries, "Compressing backup...", "compressing")
+            progress.log_operation()
 
         cmd = [
             "tar",
@@ -285,7 +291,7 @@ class Backup:
                     # Extract filename from path
                     filename = Path(line).name
                     progress.draw_progress_bar(filename)
-            progress.finish("Compressing backup...", False)
+            progress.complete_task()
 
         # Wait for subprocess to complete
         process.wait()
@@ -326,7 +332,9 @@ class Backup:
         if result.returncode != 0:
             return Err(f"Encryption failed: {result.stderr.decode()}")
 
-        print("DONE")
+        if verbose:
+            print("DONE")
+            
         return Ok(None)
 
     def make_backup(self, config: BackupState) -> Result[None]:
@@ -374,7 +382,8 @@ class Backup:
                 backup_progress: BackupProgress | None = None
 
                 if config.verbose:
-                    backup_progress = BackupProgress(len(files), "computing")
+                    backup_progress = BackupProgress(len(files), "Computing checksums...", "computing")
+                    backup_progress.log_operation()
 
                 with open(checksum_file, 'a') as checksum_fd:
                     for file in files:
@@ -391,7 +400,7 @@ class Backup:
                             backup_progress.draw_progress_bar(str(file.name))
 
                 if config.verbose and backup_progress is not None:
-                    backup_progress.finish("Computing checksums...", True)
+                    backup_progress.complete_task()
 
         # Create compressed archive
         archive_res = self.create_tarball(work_dir, temp_tarball, config.verbose)
@@ -465,7 +474,7 @@ class Backup:
         """Extract a tar archive and return the extracted path"""
         if verbose:
             print("Extracting backup...")
-
+        
         extracted_root: str = ""
 
         # Count archive content
@@ -499,7 +508,7 @@ class Backup:
 
         if verbose:
             cmd.insert(1, "-v")
-            progress = BackupProgress(len(entries), "extracting")
+            progress = BackupProgress(len(entries), "Extracting backup...", "extracting")
 
         process = subprocess.Popen(
             cmd,
@@ -518,7 +527,7 @@ class Backup:
                 if line:
                     filename = Path(line).name
                     progress.draw_progress_bar(filename)
-            progress.finish("Extracting backup...", False)
+            progress.complete_task()
 
         # Wait for process to complete
         process.wait()
@@ -536,9 +545,6 @@ class Backup:
     @staticmethod
     def verify_backup(extracted_dir: Path, checksum_file: Path, verbose: bool) -> Result[None]:
         """Verify the integrity of a backup archive"""
-        if verbose:
-            print("Verifying backup...")
-
         try:
             with open(checksum_file, 'r') as cf:
                 expected_hashes = set(line.strip() for line in cf if line.strip())
@@ -547,8 +553,10 @@ class Backup:
 
         files = Backup.collect_files(extracted_dir)
         progress = None
+        
         if verbose:
-            progress = BackupProgress(len(files), "verifying")
+            progress = BackupProgress(len(files), "Verifying backup...", "verifying")
+            progress.log_operation()
 
         for file in files:
             hash_res = Backup.compute_file_hash(file)
@@ -557,13 +565,13 @@ class Backup:
                     return hash_res
                 case Ok(value=file_hash):
                     if file_hash not in expected_hashes:
-                        return Err(f"Integrity error for '{file}'")
+                        return Err(f"{'\n' if verbose else ''}!! Integrity error for '{file}' !!")
 
             if verbose and progress is not None:
                 progress.draw_progress_bar(file.name)
 
         if verbose and progress is not None:
-            progress.finish("Verifying backup...", False)
+            progress.complete_task()
 
         return Ok(None)
     
