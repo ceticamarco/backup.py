@@ -48,10 +48,12 @@ class SignalHandler:
     def __init__(self) -> None:
         self.interrupted = False
         self.output_path: Optional[Path] = None
+        self.checksum_file: Optional[Path] = None
 
-    def setup(self, output_path: Path) -> None:
+    def setup(self, output_path: Path, checksum_file: Optional[Path] = None) -> None:
         """Configure signal handler with cleanup paths"""
         self.output_path = output_path
+        self.checksum_file = checksum_file
         signal.signal(signal.SIGINT, self.handle_interrupt)
 
     def handle_interrupt(self, _sig_num: int, _frame: Any) -> None:
@@ -75,6 +77,9 @@ class SignalHandler:
                 self.output_path / "backup.py.tmp",
                 self.output_path / "backup.py.tar.gz"
             ]
+
+            if self.checksum_file:
+                temp_files.append(self.checksum_file)
 
             Backup.cleanup_files(*temp_files)
 
@@ -198,11 +203,11 @@ class Backup:
                     path = Path(path_str.strip())
 
                     if not path.exists():
-                        return Err(f"Path does not exist: {path}.")
+                        return Err(f"Path does not exist: '{path}'.")
 
                     sources.append(BackupSource(label.strip(), path))
         except IOError as err:
-            return Err(f"Failed to read sources file: {err}.")
+            return Err(f"Failed to read sources file: '{err}'.")
 
         if not sources:
             return Err(f"No valid sources found in file.")
@@ -278,7 +283,7 @@ class Backup:
 
                 return Ok(None)
 
-            return Err(f"The following source element is neither a file nor a directory: {source}.")
+            return Err(f"The following source element is neither a file nor a directory: '{source}'.")
 
         except (IOError, OSError, shutil.Error) as err:
             return Err(f"Copy failed: {err}.")
@@ -315,7 +320,7 @@ class Backup:
                     hash_obj.update(byte_block)
             return Ok(hash_obj.hexdigest())
         except IOError as e:
-            return Err(f"Failed to read file {file_path}: {e}.")
+            return Err(f"Failed to read file '{file_path}': {e}.")
 
     @staticmethod
     def count_tar_entries(source_dir: Path) -> int:
@@ -502,7 +507,7 @@ class Backup:
         
         print(f"File name: '{backup_archive}'")
         if config.checksum:
-            print(f"Checksum file: '{checksum_file}'")
+            print(f"Checksums file: '{checksum_file}'")
         print(f"File size: {file_size} bytes ({file_size_hr})")
         print(f"Elapsed time: {self.prettify_timestamp(elapsed_time)}")
 
@@ -620,7 +625,7 @@ class Backup:
             with open(checksum_file, 'r') as cf:
                 expected_hashes = set(line.strip() for line in cf if line.strip())
         except IOError as err:
-            return Err(f"Failed to load checksum file: {err}.")
+            return Err(f"Failed to load checksums file: {err}.")
 
         files = Backup.collect_files(extracted_dir)
         progress = None
@@ -738,7 +743,13 @@ def main():
         sources_file, output_path, encryption_pass = args.backup
         sources_path = Path(sources_file)
         output_dir = Path(output_path)
-        signal_handler.setup(output_dir)
+
+        # Determine checksum file if requested
+        date_str = datetime.now().strftime("%Y%m%d")
+        hostname = os.uname().nodename
+        checksum_file = output_dir / f"backup-{hostname}-{date_str}.sha256" if args.checksum else None
+
+        signal_handler.setup(output_dir, checksum_file)
 
         # Create output directory if it doesn't exist
         if not output_dir.exists():
@@ -792,7 +803,7 @@ def main():
                 sys.exit(1)
 
             if not checksum_file.exists():
-                print(f"Checksum file '{checksum_file}' does not exist.", file=sys.stderr)
+                print(f"Checksums file '{checksum_file}' does not exist.", file=sys.stderr)
                 sys.exit(1)
 
         extract_res = backup.extract_backup(archive_file, decryption_pass, checksum_file, args.verbose)
