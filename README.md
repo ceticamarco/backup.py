@@ -1,10 +1,11 @@
 <div align="center">
     <h1>backup.py</h1>
     <h6><i>Modular and lightweight backup utility to save, encrypt and verify your personal data.</i></h6>
+    <img src="https://git.marcocetica.com/marco/backup.py/actions/workflows/backup.py.yml/badge.svg" /><br />
     <img src=".usage.gif" />
 </div>
   
-## Overview
+## Usage
 `backup.py` supports two major options: `--backup`, to create a new backup and `--extract`
 to extract an existing backup archive.
 
@@ -19,7 +20,7 @@ documents=/home/marco/Documents/
 wireguard=/etc/wireguard/wg0.conf
 ```
 
-Then, you can start the backup with the following command:
+Then, you can start the backup process with the following command:
 
 ```sh
 $ sudo ./backup.py --checksum --backup sources.ini $PWD "very_bad_pw"
@@ -45,11 +46,21 @@ Elapsed time: 1 minute, 3 seconds
 This will create a new directory named `backup.py.tmp` on your local path. Just like before,
 the `-c` option is optional.
 
-## Usage
+## Installation
 As stated before, `python.py` is built from scratch in modern Python (3.10+) without using 
-any external dependency except for `tar` and `gpg`. 
+any external library except for `tar` and `gpg`. The program will automatically check whether
+these dependencies are installed at startup.
 
-The *sources file* follows an INI-like syntax structured using associative records between
+You can therefore copy the program wherever you like. For instance, to install it under `/usr/bin/python.py`, issue
+the following command:
+
+```sh
+$ sudo cp -Rv "$(pwd)/backup.py" /usr/bin/backup.py
+'/home/marco/Projects/backup.py/backup.py' -> '/usr/bin/backup.py'
+```
+
+## Technical details
+The *sources file* follows an INI-like syntax built using associative records between
 labels and absolute paths. In order words:
 
 ```ini
