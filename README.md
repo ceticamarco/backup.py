@@ -33,7 +33,7 @@ File size: 5533818904 bytes (5.15 GiB)
 Elapsed time: 2 minutes, 12 seconds
 ```
 
-The `--checsum` (optional) is used to generate a checksum file containing the hashes of each single of the backup.
+The `--checksum` (optional) is used to generate a checksum file containing the hashes of each single of the backup.
 
 To extract an existing backup, you can instead issue the following command:
 
