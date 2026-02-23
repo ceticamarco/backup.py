@@ -100,7 +100,6 @@ class EscapeChar(Enum):
 
 class BackupProgress:
     """Progress indicator for backup operations"""
-
     def __init__(self, total: int, operation: str, status_msg: str) -> None:
         self.total = total
         self.current = 0
@@ -442,10 +441,6 @@ class Backup:
 
     def make_backup(self, config: BackupState) -> Result[None]:
         """Create an encrypted backup from specified sources file"""
-        # Check root permissions
-        if os.geteuid() != 0:
-            return Err("Run this program as root.")
-
         start_time = time.time()
         date_str = datetime.now().strftime("%Y%m%d")
         hostname = os.uname().nodename
@@ -806,6 +801,11 @@ def main():
     backup = Backup()
 
     if args.backup:
+        # Check root permissions
+        if os.geteuid() != 0:
+            print("The '--backup' option requires root permissions.", file=sys.stderr)
+            sys.exit(1)
+
         sources_file, output_path, encryption_pass = args.backup
         sources_path = Path(sources_file)
         output_dir = Path(output_path)
@@ -817,9 +817,10 @@ def main():
 
         signal_handler.setup(output_dir, checksum_file)
 
-        # Create output directory if it doesn't exist
+        # Check whether output directory exists
         if not output_dir.exists():
-            output_dir.mkdir(parents=True, exist_ok=True)
+            print(f"Output directory '{output_dir}' does not exist.", file=sys.stderr)
+            sys.exit(1)
 
         # Parse sources file
         sources_res = Backup.parse_sources_file(sources_path)
