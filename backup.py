@@ -11,11 +11,18 @@ import time
 import subprocess
 import hashlib
 import signal
+import struct
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Generic, TypeVar, Union, Optional, List
+
+HEADER_SIZE = 16
+HEADER_FORMAT = ">QQ"
+HEADER_MAGIC_NUMBER = 0x424B5F50595F4844 # BK_PY_HD
+WORKDIR_NAME = "backup.py.tmp"
+TARBALL_NAME = "backup.py.tar.gz"
 
 T = TypeVar("T")
 @dataclass(frozen=True)
@@ -75,8 +82,8 @@ class SignalHandler:
 
         if self.output_path:
             temp_files = [
-                self.output_path / "backup.py.tmp",
-                self.output_path / "backup.py.tar.gz"
+                self.output_path / WORKDIR_NAME,
+                self.output_path / TARBALL_NAME
             ]
 
             if self.checksum_file:
@@ -123,7 +130,7 @@ class BackupProgress:
         actual = min(self.current, self.total)
         percentage = (actual / self.total) * 100 if self.total > 0 else 0
 
-        # Create a CLI prograss bar
+        # Create a CLI progress bar
         bar_width = 30
         filled = int(bar_width * actual / self.total)
         bar = f"{EscapeChar.GRAY.value}{'█' * filled}{'░' * (bar_width - filled)}{EscapeChar.RESET.value}"
@@ -154,11 +161,39 @@ class BackupProgress:
         #  2. Move the cursor at end of operation message (i.e., rewrite the message)
         #  3. Add duration there
         #  4. Move the cursor downwards one line
-        duration = time.time() - self.start_time
+        duration = Backup.prettify_timestamp(time.time() - self.start_time)
         print(f"{EscapeChar.LINE_UP.value}\r{self.operation}{EscapeChar.GREEN.value}DONE{EscapeChar.RESET.value} "
-              f"({EscapeChar.CYAN.value}{duration:.2f}s{EscapeChar.RESET.value})\n")
+              f"({EscapeChar.CYAN.value}{duration}{EscapeChar.RESET.value})\n")
 
 class Backup:
+    @staticmethod
+    def build_header(entry_count: int) -> bytes:
+        """Build an header containing backup metadata"""
+        # Header format:
+        #   big endian (>), 1 uint64 (Q, 8 bytes) + 1 uint64 (Q, 8 bytes) = 16 bytes
+
+        return struct.pack(
+            HEADER_FORMAT,
+            HEADER_MAGIC_NUMBER,
+            entry_count
+        )
+
+    @staticmethod
+    def parse_header(data: bytes) -> Result[int]:
+        """Parse metadata from a backup file"""
+        if len(data) < HEADER_SIZE:
+            return Err("File too small to contain a valid header.")
+
+        try:
+            magic, entry_count = struct.unpack(HEADER_FORMAT, data[:HEADER_SIZE])
+        except struct.error as err:
+            return Err(f"Malformed header: {err}.")
+
+        if magic != HEADER_MAGIC_NUMBER:
+            return Err("Invalid magic number.")
+
+        return Ok(entry_count)
+
     @staticmethod
     def check_deps() -> Result[None]:
         """Check whether dependencies are installed"""
@@ -353,11 +388,11 @@ class Backup:
         return sum(1 for _ in source_dir.rglob('*')) + 1
 
     @staticmethod
-    def create_tarball(source_dir: Path, output_file: Path, verbose: bool) -> Result[None]:
+    def create_tarball(source_dir: Path, output_file: Path, verbose: bool) -> Result[int]:
         """Create a compressed tar archive of the backup directory"""
+        total_entries = Backup.count_tar_entries(source_dir)
         progress: BackupProgress | None = None
         if verbose:
-            total_entries = Backup.count_tar_entries(source_dir)
             progress = BackupProgress(total_entries, "Compressing backup...", "compressing")
             progress.log_operation()
 
@@ -400,18 +435,23 @@ class Backup:
         if process.returncode != 0:
             return Err("Cannot create compressed archive.")
 
-        return Ok(None)
+        return Ok(total_entries)
 
     @staticmethod
-    def encrypt_file(input_file: Path, output_file: Path, password: str, verbose: bool) -> Result[None]:
-        """Encrypt a file with GPG in symmetric mode (using AES256)"""
+    def encrypt_file(input_file: Path, output_file: Path, password: str,
+                     entry_count: int, verbose: bool) -> Result[None]:
+        """Encrypt a file with GPG and prepend an header"""
         start_time = time.time()
 
         if output_file.exists():
             return Err("Encryption failed: archive already exists.")
-        
+
         if verbose:
             print("Encrypting backup...", end='', flush=True)
+
+        # Write the encrypted file to a temporary file first. Then prepend
+        # the header afterward
+        tmp_enc = output_file.with_suffix(".enc.tmp")
 
         cmd = [
             "gpg", "-a",
@@ -421,7 +461,7 @@ class Backup:
             "--pinentry-mode=loopback",
             "--batch",
             "--passphrase-fd", "0",
-            "--output", str(output_file),
+            "--output", str(tmp_enc),
             str(input_file)
         ]
 
@@ -432,12 +472,23 @@ class Backup:
         )
 
         if result.returncode != 0:
+            tmp_enc.unlink(missing_ok=True)
             return Err(f"Encryption failed: {result.stderr.decode()}.")
 
+        try:
+            header = Backup.build_header(entry_count)
+            with open(output_file, "wb") as out, open(tmp_enc, "rb") as enc:
+                out.write(header) # Write header on the first 16 bytes of the file
+                shutil.copyfileobj(enc, out)
+        except IOError as err:
+            return Err(f"Failed to write encrypted backup file: {err}.")
+        finally:
+            tmp_enc.unlink(missing_ok=True)
+
         if verbose:
-            duration = time.time() - start_time
+            duration = Backup.prettify_timestamp(time.time() - start_time)
             print(f"{EscapeChar.GREEN.value}DONE{EscapeChar.RESET.value}"
-                  f" ({EscapeChar.CYAN.value}{duration:.2f}s{EscapeChar.RESET.value})")
+                  f" ({EscapeChar.CYAN.value}{duration}{EscapeChar.RESET.value})")
             
         return Ok(None)
 
@@ -455,7 +506,7 @@ class Backup:
         # Format output files
         backup_archive = config.output_path / f"backup-{hostname}-{date_str}.tar.gz.enc"
         checksum_file = config.output_path / f"backup-{hostname}-{date_str}.sha256"
-        temp_tarball = config.output_path / "backup.py.tar.gz"
+        temp_tarball = config.output_path / TARBALL_NAME
 
         # Backup each source
         sources_count = len(config.sources)
@@ -477,9 +528,9 @@ class Backup:
                     return copy_res
                 case Ok():
                     if config.verbose:
-                        duration = time.time() - start_time
+                        duration = Backup.prettify_timestamp(time.time() - start_time)
                         print(f"{EscapeChar.GREEN.value}DONE{EscapeChar.RESET.value}"
-                              f" ({EscapeChar.CYAN.value}{duration:.2f}s{EscapeChar.RESET.value})")
+                              f" ({EscapeChar.CYAN.value}{duration}{EscapeChar.RESET.value})")
 
             # Compute checksum when requested
             if config.checksum:
@@ -508,29 +559,22 @@ class Backup:
                 if config.verbose and backup_progress is not None:
                     backup_progress.complete_task()
 
-            # Add a blank line between each backup entry (on verbose mode)
-            if config.verbose:
-                print("")
-
         # Create compressed archive
+        entry_count: int = 0
         archive_res = self.create_tarball(work_dir, temp_tarball, config.verbose)
         match archive_res:
             case Err():
                 self.cleanup_files(work_dir, temp_tarball)
                 return archive_res
-            case Ok():
-                if config.verbose:
-                    print("")
+            case Ok(value=entry_count): pass
 
         # Encrypt the archive
-        encrypt_res = self.encrypt_file(temp_tarball, backup_archive, config.password, config.verbose)
+        encrypt_res = self.encrypt_file(temp_tarball, backup_archive, config.password, entry_count, config.verbose)
         match encrypt_res:
             case Err():
                 self.cleanup_files(work_dir, temp_tarball)
                 return encrypt_res
-            case Ok():
-                if config.verbose:
-                    print("")
+            case Ok(): pass
 
         # Cleanup temporary files
         self.cleanup_files(work_dir, temp_tarball)
@@ -567,12 +611,33 @@ class Backup:
         return Ok(None)
 
     @staticmethod
-    def decrypt_file(input_file: Path, output_file: Path, password: str, verbose: bool) -> Result[None]:
-        """Decrypt an encrypted backup archive"""
+    def decrypt_file(input_file: Path, output_file: Path, password: str, verbose: bool) -> Result[int]:
+        """Strip header, decrypt the backup file and return entry count"""
         start_time = 0
         if verbose:
             start_time = time.time()
             print("Decrypting backup...", end='', flush=True)
+
+        try:
+            with open(input_file, "rb") as file:
+                header_data = file.read(HEADER_SIZE)
+        except IOError as err:
+            return Err(f"Failed to read encrypted backup file: {err}.")
+
+        header_res = Backup.parse_header(header_data)
+        match header_res:
+            case Err():
+                return header_res
+            case Ok(value=entry_res): pass
+
+        tmp_payload = input_file.with_suffix(".payload.tmp")
+        try:
+            with open(input_file, "rb") as src, open(tmp_payload, "wb") as dest:
+                src.seek(HEADER_SIZE)
+                shutil.copyfileobj(src, dest)
+        except IOError as err:
+            tmp_payload.unlink(missing_ok=True)
+            return Err(f"Failed to strip header from backup file: {err}.")
 
         cmd = [
             "gpg", "-a",
@@ -583,7 +648,7 @@ class Backup:
             "--batch",
             "--passphrase-fd", "0",
             "--output", str(output_file),
-            str(input_file)
+            str(tmp_payload)
         ]
 
         result = subprocess.run(
@@ -592,44 +657,25 @@ class Backup:
             capture_output=True
         )
 
+        tmp_payload.unlink(missing_ok=True)
+
         if result.returncode != 0:
             return Err(f"Decryption failed: {result.stderr.decode()}.")
 
         if verbose:
-            duration = time.time() - start_time
+            duration = Backup.prettify_timestamp(time.time() - start_time)
             print(f"{EscapeChar.GREEN.value}DONE{EscapeChar.RESET.value}"
-                  f" ({EscapeChar.CYAN.value}{duration:.2f}s{EscapeChar.RESET.value})")
+                  f" ({EscapeChar.CYAN.value}{duration}{EscapeChar.RESET.value})")
 
-        return Ok(None)
+        return Ok(entry_res)
 
     @staticmethod
-    def extract_tarball(archive_file: Path, verbose: bool) -> Result[Path]:
+    def extract_tarball(archive_file: Path, entry_count: int, verbose: bool) -> Result[Path]:
         """Extract a tar archive and return the extracted path"""
         start_time = 0
         if verbose:
             start_time = time.time()
             print("Extracting backup...")
-        
-        extracted_root: str = ""
-
-        # Count archive content
-        list_cmd = ["tar", "-tzf", str(archive_file)]
-        try:
-            list_res = subprocess.run(
-                list_cmd,
-                capture_output=True,
-                text=True,
-                check=True
-            )
-            entries = list_res.stdout.strip().split('\n')
-            if not entries or not entries[0]:
-                return Err("Archive is empty or corrupted.")
-
-            # Retrieve root directory from first entry
-            extracted_root = entries[0].split('/')[0]
-
-        except subprocess.CalledProcessError as err:
-            return Err(f"Failed to list archive content: {err}.")
 
         cmd = [
             "tar",
@@ -643,7 +689,7 @@ class Backup:
 
         if verbose:
             cmd.insert(1, "-v")
-            progress = BackupProgress(len(entries), "Extracting backup...", "extracting")
+            progress = BackupProgress(entry_count, "Extracting backup...", "extracting")
             progress.start_time_tracking(start_time)
 
         process = subprocess.Popen(
@@ -671,7 +717,7 @@ class Backup:
         if process.returncode != 0:
             return Err("Unable to extract compressed archive.")
 
-        root_path = archive_file.parent / extracted_root
+        root_path = archive_file.parent / WORKDIR_NAME
 
         if not root_path.exists():
             return Err(f"Extracted '{root_path}' not found.")
@@ -715,17 +761,18 @@ class Backup:
         """Extract and verify a backup archive"""
         start_time = time.time()
         
-        temp_tarball = archive_file.parent / Path("backup.py.tar.gz")
-
+        temp_tarball = archive_file.parent / TARBALL_NAME
+        entry_count = 0
         decrypt_res = self.decrypt_file(archive_file, temp_tarball, password, verbose)
         match decrypt_res:
             case Err():
                 self.cleanup_files(temp_tarball)
                 return decrypt_res
-            case Ok(): pass
+            case Ok(value=count):
+                entry_count = count
 
         extracted_dir: Path | None = None
-        extract_res = self.extract_tarball(temp_tarball, verbose)
+        extract_res = self.extract_tarball(temp_tarball, entry_count, verbose)
         match extract_res:
             case Err():
                 self.cleanup_files(temp_tarball)
@@ -740,9 +787,7 @@ class Backup:
                 case Err():
                     self.cleanup_files(temp_tarball, extracted_dir)
                     return checksums_res
-                case Ok():
-                    if verbose:
-                        print("")
+                case Ok(): pass
 
         self.cleanup_files(temp_tarball)
 
