@@ -113,7 +113,7 @@ class TestBackup:
         print("\n[TEST 1] Backup creation without checksum")
 
         returncode, _, _ = self.run_backup_command([
-            "--backup",
+            "create",
             str(self.sources_file),
             str(self.backup_dir),
             self.test_password
@@ -153,12 +153,11 @@ class TestBackup:
             f.unlink()
 
         returncode, _, _ = self.run_backup_command([
-            "--backup",
+            "create",
+            "-Vc",
             str(self.sources_file),
             str(self.backup_dir),
             self.test_password,
-            "--checksum",
-            "--verbose"
         ])
 
         if returncode != 0:
@@ -197,10 +196,9 @@ class TestBackup:
             return False
 
         returncode, _, _ = self.run_backup_command([
-            "--extract",
+            "extract",
             str(archive),
-            self.test_password,
-            "--verbose"
+            self.test_password
         ])
 
         if returncode != 0:
@@ -229,7 +227,7 @@ class TestBackup:
         if not self.verify_files_exist(extracted_dirs, ["dir1", "dir2", "single"]):
             return False
 
-        # Leave test envuronment clean for next test
+        # Leave test environment clean for next test
         shutil.rmtree(extracted_dirs)
 
         return True
@@ -246,12 +244,11 @@ class TestBackup:
             return False
 
         returncode, _, _ = self.run_backup_command([
-            "--checksum",
-            "--extract",
+            "extract",
             str(archive),
             self.test_password,
-            str(checksums),
-            "--verbose"
+            "--checksum",
+            str(checksums)
         ])
 
         if returncode != 0:
@@ -297,7 +294,7 @@ class TestBackup:
             f.write(f"another_valid={self.test_dir}\n")
 
         returncode, _, stderr = self.run_backup_command([
-            "--backup",
+            "create",
             str(invalid_sources),
             str(self.backup_dir),
             self.test_password,
@@ -318,7 +315,7 @@ class TestBackup:
             return False
 
     def test_missing_source_path(self) -> bool:
-        """Test: Source paht doesn't exist"""
+        """Test: Source path doesn't exist"""
         print("\n[TEST 6] Missing source path")
 
         # Create sources file with invalid path
@@ -332,7 +329,7 @@ class TestBackup:
             f.write("missing=/invalid/path/foo/bar\n")
 
         returncode, _, stderr = self.run_backup_command([
-            "--backup",
+            "create",
             str(missing_sources),
             str(self.backup_dir),
             self.test_password,
@@ -365,7 +362,7 @@ class TestBackup:
 
         # Extract without verification
         returncode, _, _ = self.run_backup_command([
-            "--extract",
+            "extract",
             str(archive),
             self.test_password
         ], check=False)

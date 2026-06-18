@@ -1,0 +1,28 @@
+name: backup.py
+on: [push,pull_request,workflow_dispatch]
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y tar gpg nodejs npm
+      
+      - name: Install Python tools
+        run: |
+          sudo pip install ruff
+          sudo npm install --global pyright
+
+      - name: Run Pyright
+        run: pyright backup.py
+
+      - name: Run Ruff
+        run: ruff check .
+
+      - name: Run unit tests
+        run: |
+          sudo python3 test_backup.py backup.py

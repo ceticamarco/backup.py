@@ -16,7 +16,7 @@ from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Generic, TypeVar, Union, Optional, List
+from typing import Any, Generic, TypeVar, Optional, List, TypeAlias
 
 HEADER_SIZE = 16
 HEADER_FORMAT = ">QQ"
@@ -34,7 +34,7 @@ class Ok(Generic[T]):
 class Err:
     error: str
 
-Result = Union[Ok[T], Err]
+Result: TypeAlias = Ok[T] | Err
 
 @dataclass
 class BackupSource:
@@ -74,7 +74,7 @@ class SignalHandler:
         # First C-c: cleanup and set flag
         self.interrupted = True
         print(
-            "\nBackup interrupted.\nCleaning up temporary files (press C-c again to force exit)...",
+            "\nBackup interrupted.\nCleaning up temporary files (press CTRL+C again to force exit)...",
             file=sys.stderr,
             end='',
             flush=True
@@ -114,7 +114,7 @@ class BackupProgress:
         self.status_msg = status_msg
         self.start_time = 0
 
-    def start_time_tracking(self, existing_time = None) -> None:
+    def start_time_tracking(self, existing_time: float | None = None) -> None:
         """Initialize time tracking"""
         self.start_time = time.time() if not existing_time else existing_time
 
@@ -197,7 +197,7 @@ class Backup:
     @staticmethod
     def check_deps() -> Result[None]:
         """Check whether dependencies are installed"""
-        missing_deps = []
+        missing_deps: list[str] = []
         for dep in ["gpg", "tar"]:
             if not shutil.which(dep):
                 missing_deps.append(dep)
@@ -232,7 +232,7 @@ class Backup:
         minutes = (timestamp_int % 3600) // 60
         seconds = timestamp_int % 60
 
-        parts = []
+        parts: list[str] = []
         if hours > 0:
             parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
         if minutes > 0:
@@ -270,7 +270,7 @@ class Backup:
             return Err(f"Failed to read sources file: '{err}'.")
 
         if not sources:
-            return Err(f"No valid sources found in file.")
+            return Err("No valid sources found in file.")
 
         return Ok(sources)
 
@@ -349,7 +349,7 @@ class Backup:
             return Err(f"Copy failed: {err}.")
 
     @staticmethod
-    def cleanup_files(*paths: Path) -> None:
+    def cleanup_files(*paths: Path | None) -> None:
         """Clean up temporary files and directories"""
         for path in paths:
             if path is None or not path.exists():
@@ -363,7 +363,7 @@ class Backup:
     @staticmethod
     def collect_files(directory: Path) -> List[Path]:
         """Collect all files in a directory (recursively)"""
-        files = []
+        files: list[Path] = []
         for item in directory.rglob('*'):
             if item.is_file() and not item.is_symlink():
                 files.append(item)
@@ -448,10 +448,16 @@ class Backup:
 
         if verbose:
             print("Encrypting backup...", end='', flush=True)
-
-        # Write the encrypted file to a temporary file first. Then prepend
-        # the header afterward
-        tmp_enc = output_file.with_suffix(".enc.tmp")
+        
+        # Prepend the header to the tarball first and then encrypt it
+        tmp_payload = input_file.with_suffix(".payload.tmp")
+        try:
+            header = Backup.build_header(entry_count)
+            with open(tmp_payload, "wb") as out, open(input_file, "rb") as src:
+                out.write(header)
+                shutil.copyfileobj(src, out)
+        except IOError as err:
+            return Err(f"Failed to prepend header to tarball: {err}.")
 
         cmd = [
             "gpg", "-a",
@@ -461,8 +467,8 @@ class Backup:
             "--pinentry-mode=loopback",
             "--batch",
             "--passphrase-fd", "0",
-            "--output", str(tmp_enc),
-            str(input_file)
+            "--output", str(output_file),
+            str(tmp_payload)
         ]
 
         result = subprocess.run(
@@ -471,19 +477,10 @@ class Backup:
             capture_output=not verbose
         )
 
-        if result.returncode != 0:
-            tmp_enc.unlink(missing_ok=True)
-            return Err(f"Encryption failed: {result.stderr.decode()}.")
+        tmp_payload.unlink(missing_ok=True)
 
-        try:
-            header = Backup.build_header(entry_count)
-            with open(output_file, "wb") as out, open(tmp_enc, "rb") as enc:
-                out.write(header) # Write header on the first 16 bytes of the file
-                shutil.copyfileobj(enc, out)
-        except IOError as err:
-            return Err(f"Failed to write encrypted backup file: {err}.")
-        finally:
-            tmp_enc.unlink(missing_ok=True)
+        if result.returncode != 0:
+            return Err(f"Encryption failed: {result.stderr.decode()}.")
 
         if verbose:
             duration = Backup.prettify_timestamp(time.time() - start_time)
@@ -566,7 +563,8 @@ class Backup:
             case Err():
                 self.cleanup_files(work_dir, temp_tarball)
                 return archive_res
-            case Ok(value=entry_count): pass
+            case Ok(value=entry_count):
+                pass
 
         # Encrypt the archive
         encrypt_res = self.encrypt_file(temp_tarball, backup_archive, config.password, entry_count, config.verbose)
@@ -574,7 +572,8 @@ class Backup:
             case Err():
                 self.cleanup_files(work_dir, temp_tarball)
                 return encrypt_res
-            case Ok(): pass
+            case Ok():
+                pass
 
         # Cleanup temporary files
         self.cleanup_files(work_dir, temp_tarball)
@@ -618,26 +617,7 @@ class Backup:
             start_time = time.time()
             print("Decrypting backup...", end='', flush=True)
 
-        try:
-            with open(input_file, "rb") as file:
-                header_data = file.read(HEADER_SIZE)
-        except IOError as err:
-            return Err(f"Failed to read encrypted backup file: {err}.")
-
-        header_res = Backup.parse_header(header_data)
-        match header_res:
-            case Err():
-                return header_res
-            case Ok(value=entry_res): pass
-
-        tmp_payload = input_file.with_suffix(".payload.tmp")
-        try:
-            with open(input_file, "rb") as src, open(tmp_payload, "wb") as dest:
-                src.seek(HEADER_SIZE)
-                shutil.copyfileobj(src, dest)
-        except IOError as err:
-            tmp_payload.unlink(missing_ok=True)
-            return Err(f"Failed to strip header from backup file: {err}.")
+        tmp_decrypted = input_file.with_suffix(".dec.tmp")
 
         cmd = [
             "gpg", "-a",
@@ -647,8 +627,8 @@ class Backup:
             "--pinentry-mode=loopback",
             "--batch",
             "--passphrase-fd", "0",
-            "--output", str(output_file),
-            str(tmp_payload)
+            "--output", str(tmp_decrypted),
+            str(input_file)
         ]
 
         result = subprocess.run(
@@ -657,17 +637,38 @@ class Backup:
             capture_output=True
         )
 
-        tmp_payload.unlink(missing_ok=True)
-
         if result.returncode != 0:
+            tmp_decrypted.unlink(missing_ok=True)
             return Err(f"Decryption failed: {result.stderr.decode()}.")
+        
+        try:
+            with open(tmp_decrypted, "rb") as file:
+                # Read header and move file cursor at the end of the header
+                header_data = file.read(HEADER_SIZE)
+
+                header_res = Backup.parse_header(header_data)
+                match header_res:
+                    case Err():
+                        return header_res
+                    case Ok(value=entry_count):
+                        pass
+
+                with open(output_file, "wb") as out:
+                    # Write everything after the header, that is the actual file content.
+                    # The file cursor was moved at the end of the header by previous
+                    # read operation
+                    shutil.copyfileobj(file, out)
+        except IOError as err:
+            return Err(f"Failed to strip header from decrypted file: {err}.")
+        finally:
+            tmp_decrypted.unlink(missing_ok=True)
 
         if verbose:
             duration = Backup.prettify_timestamp(time.time() - start_time)
             print(f"{EscapeChar.GREEN.value}DONE{EscapeChar.RESET.value}"
                   f" ({EscapeChar.CYAN.value}{duration}{EscapeChar.RESET.value})")
 
-        return Ok(entry_res)
+        return Ok(entry_count)
 
     @staticmethod
     def extract_tarball(archive_file: Path, entry_count: int, verbose: bool) -> Result[Path]:
@@ -787,7 +788,8 @@ class Backup:
                 case Err():
                     self.cleanup_files(temp_tarball, extracted_dir)
                     return checksums_res
-                case Ok(): pass
+                case Ok():
+                    pass
 
         self.cleanup_files(temp_tarball)
 
@@ -801,41 +803,54 @@ class Backup:
 
 def main():
     signal_handler = SignalHandler()
-
     parser = argparse.ArgumentParser(
         description="backup.py - modular and lightweight backup utility"
     )
 
-    parser.add_argument(
-        "-b", "--backup",
-        nargs=3,
-        metavar=("SOURCES", "DEST", "PASS"),
-        help="Backup files from SOURCES path to DEST directory with password PASS"
-    )
-
-    parser.add_argument(
-        "-e", "--extract",
-        nargs="+",
-        metavar="ARCHIVE",
-        help="Extract ARCHIVE (optionally with PASS and SHA256 file)"
-    )
-
-    parser.add_argument(
-        "-c", "--checksum",
-        action="store_true",
-        help="Generate or check SHA256 checksums"
-    )
-
-    parser.add_argument(
+    # Parent parser for commands shared across subcommands
+    parent_command = argparse.ArgumentParser(add_help=False)
+    parent_command.add_argument(
         "-V", "--verbose",
         action="store_true",
         help="Enable verbose mode"
     )
 
-    args = parser.parse_args()
+    subcommands = parser.add_subparsers(
+        dest="command",
+        required=True,
+        help="Available commands"
+    )
 
-    if not (args.backup or args.extract):
-        parser.error("specify either --backup or --extract.")
+    # Subparser for the "create" command
+    create_cmd = subcommands.add_parser(
+        "create",
+        parents=[parent_command],
+        help="Create a new backup"
+    )
+    create_cmd.add_argument("sources", help="Path to the sources file")
+    create_cmd.add_argument("dest", help="Destination directory")
+    create_cmd.add_argument("password", help="Encryption password")
+    create_cmd.add_argument(
+        "-c", "--checksum",
+        action="store_true",
+        help="Generate SHA256 checksums"
+    )
+
+    # Subparser for the "extract" command
+    extract_cmd = subcommands.add_parser(
+        "extract",
+        parents=[parent_command],
+        help="Extract an existing backup archive"
+    )
+    extract_cmd.add_argument("archive", help="Path to the encrypted archive")
+    extract_cmd.add_argument("password", help="Decryption password")
+    extract_cmd.add_argument(
+        "-c", "--checksum",
+        metavar="SHA256_FILE",
+        help="Check SHA256 checksums against the provided backup"
+    )
+
+    args = parser.parse_args()
 
     # Check whether dependencies are installed
     deps_res = Backup.check_deps()
@@ -843,19 +858,19 @@ def main():
         case Err(error=e):
             print(f"{e}", file=sys.stderr)
             sys.exit(1)
-        case Ok(): pass
+        case Ok():
+            pass
 
     backup = Backup()
 
-    if args.backup:
+    if args.command == "create":
         # Check root permissions
         if os.geteuid() != 0:
-            print("The '--backup' option requires root permissions.", file=sys.stderr)
+            print("The 'create' option requires root permissions.", file=sys.stderr)
             sys.exit(1)
 
-        sources_file, output_path, encryption_pass = args.backup
-        sources_path = Path(sources_file)
-        output_dir = Path(output_path)
+        sources_path = Path(args.sources)
+        output_dir = Path(args.dest)
 
         # Determine checksum file if requested
         date_str = datetime.now().strftime("%Y%m%d")
@@ -881,7 +896,7 @@ def main():
                 config = BackupState(
                     sources=v,
                     output_path=output_dir,
-                    password=encryption_pass,
+                    password=args.password,
                     checksum=args.checksum,
                     verbose=args.verbose
                 )
@@ -891,43 +906,33 @@ def main():
             case Err(error=e):
                 print(f"{e}", file=sys.stderr)
                 sys.exit(1)
+            case Ok():
+                pass
 
-    elif args.extract:
-        archive_file = Path(args.extract[0])
+    elif args.command == "extract":
+        archive_file = Path(args.archive)
         signal_handler.setup(archive_file.parent)
 
         if not archive_file.exists():
             print(f"Archive file '{archive_file}' does not exist.", file=sys.stderr)
             sys.exit(1)
 
-        decryption_pass: str = ""
         checksum_file: Path | None = None
 
-        if len(args.extract) >= 2:
-            decryption_pass = args.extract[1]
-        else:
-            print("--extract flag requires decryption password as second argument.", file=sys.stderr)
-            sys.exit(1)
-
         if args.checksum:
-            if len(args.extract) >= 3:
-                checksum_file = Path(args.extract[2])
-            else:
-                print("--checksum flag requires SHA256 file as third argument.", file=sys.stderr)
-                sys.exit(1)
+            checksum_file = Path(args.checksum)
 
             if not checksum_file.exists():
                 print(f"Checksums file '{checksum_file}' does not exist.", file=sys.stderr)
                 sys.exit(1)
 
-        extract_res = backup.extract_backup(archive_file, decryption_pass, checksum_file, args.verbose)
+        extract_res = backup.extract_backup(archive_file, args.password, checksum_file, args.verbose)
         match extract_res:
             case Err(error=e):
                 print(f"{e}", file=sys.stderr)
                 sys.exit(1)
-    else:
-        parser.print_help()
-        sys.exit(1)
+            case Ok():
+                pass
 
 if __name__ == "__main__":
     main()
