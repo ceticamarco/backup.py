@@ -132,7 +132,7 @@ class BackupProgress:
 
         # Create a CLI progress bar
         bar_width = 30
-        filled = int(bar_width * actual / self.total)
+        filled = int(bar_width * actual / self.total) if self.total > 0 else 0
         bar = f"{EscapeChar.GRAY.value}{'█' * filled}{'░' * (bar_width - filled)}{EscapeChar.RESET.value}"
 
         # Truncate filename if it's too long to display
